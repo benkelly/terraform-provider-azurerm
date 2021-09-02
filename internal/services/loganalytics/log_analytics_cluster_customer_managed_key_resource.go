@@ -9,6 +9,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/services/operationalinsights/mgmt/2020-08-01/operationalinsights"
 	"github.com/hashicorp/terraform-provider-azurerm/helpers/tf"
 	"github.com/hashicorp/terraform-provider-azurerm/internal/clients"
+	"github.com/hashicorp/terraform-provider-azurerm/internal/locks"
 	keyVaultParse "github.com/hashicorp/terraform-provider-azurerm/internal/services/keyvault/parse"
 	keyVaultValidate "github.com/hashicorp/terraform-provider-azurerm/internal/services/keyvault/validate"
 	"github.com/hashicorp/terraform-provider-azurerm/internal/services/loganalytics/parse"
@@ -20,7 +21,7 @@ import (
 
 func resourceLogAnalyticsClusterCustomerManagedKey() *pluginsdk.Resource {
 	return &pluginsdk.Resource{
-		Create: resourceLogAnalyticsClusterCustomerManagedKeyCreate,
+		Create: resourceLogAnalyticsClusterCustomerManagedKeyUpdate,
 		Read:   resourceLogAnalyticsClusterCustomerManagedKeyRead,
 		Update: resourceLogAnalyticsClusterCustomerManagedKeyUpdate,
 		Delete: resourceLogAnalyticsClusterCustomerManagedKeyDelete,
@@ -52,16 +53,24 @@ func resourceLogAnalyticsClusterCustomerManagedKey() *pluginsdk.Resource {
 	}
 }
 
-func resourceLogAnalyticsClusterCustomerManagedKeyCreate(d *pluginsdk.ResourceData, meta interface{}) error {
+func resourceLogAnalyticsClusterCustomerManagedKeyUpdate(d *pluginsdk.ResourceData, meta interface{}) error {
 	client := meta.(*clients.Client).LogAnalytics.ClusterClient
 	ctx, cancel := timeouts.ForCreateUpdate(meta.(*clients.Client).StopContext, d)
 	defer cancel()
+
+	keyId, err := keyVaultParse.ParseOptionallyVersionedNestedItemID(d.Get("key_vault_key_id").(string))
+	if err != nil {
+		return fmt.Errorf("could not parse Key Vault Key ID: %+v", err)
+	}
 
 	clusterIdRaw := d.Get("log_analytics_cluster_id").(string)
 	clusterId, err := parse.LogAnalyticsClusterID(clusterIdRaw)
 	if err != nil {
 		return err
 	}
+
+	locks.ByName(clusterId.ClusterName, "azurerm_log_analytics_cluster")
+	defer locks.UnlockByName(clusterId.ClusterName, "azurerm_log_analytics_cluster")
 
 	resp, err := client.Get(ctx, clusterId.ResourceGroup, clusterId.ClusterName)
 	if err != nil {
@@ -76,41 +85,45 @@ func resourceLogAnalyticsClusterCustomerManagedKeyCreate(d *pluginsdk.ResourceDa
 			return tf.ImportAsExistsError("azurerm_log_analytics_cluster_customer_managed_key", fmt.Sprintf("%s/CMK", clusterIdRaw))
 		}
 	}
-
 	d.SetId(fmt.Sprintf("%s/CMK", clusterIdRaw))
-	return resourceLogAnalyticsClusterCustomerManagedKeyUpdate(d, meta)
-}
 
-func resourceLogAnalyticsClusterCustomerManagedKeyUpdate(d *pluginsdk.ResourceData, meta interface{}) error {
-	client := meta.(*clients.Client).LogAnalytics.ClusterClient
-	ctx, cancel := timeouts.ForCreateUpdate(meta.(*clients.Client).StopContext, d)
-	defer cancel()
-
-	keyId, err := keyVaultParse.ParseOptionallyVersionedNestedItemID(d.Get("key_vault_key_id").(string))
-	if err != nil {
-		return fmt.Errorf("could not parse Key Vault Key ID: %+v", err)
+	capacity := 0
+	if sku := resp.Sku; sku != nil {
+		if sku.Capacity != nil {
+			capacity = int(*sku.Capacity)
+		}
 	}
 
-	clusterId, err := parse.LogAnalyticsClusterID(d.Get("log_analytics_cluster_id").(string))
-	if err != nil {
-		return err
-	}
-
-	clusterPatch := operationalinsights.ClusterPatch{
-		ClusterPatchProperties: &operationalinsights.ClusterPatchProperties{
-			KeyVaultProperties: &operationalinsights.KeyVaultProperties{
-				KeyVaultURI: utils.String(keyId.KeyVaultBaseUrl),
-				KeyName:     utils.String(keyId.Name),
-				KeyVersion:  utils.String(keyId.Version),
-			},
+	parameters := operationalinsights.Cluster{
+		Location: resp.Location,
+		Identity: resp.Identity,
+		Sku: &operationalinsights.ClusterSku{
+			Capacity: utils.Int64(int64(capacity)),
+			Name:     operationalinsights.CapacityReservation,
+		},
+		Tags: resp.Tags,
+		ClusterProperties: &operationalinsights.ClusterProperties{KeyVaultProperties: &operationalinsights.KeyVaultProperties{
+			KeyVaultURI: utils.String(keyId.KeyVaultBaseUrl),
+			KeyName:     utils.String(keyId.Name),
+			KeyVersion:  utils.String(keyId.Version),
+		},
 		},
 	}
 
-	if _, err := client.Update(ctx, clusterId.ResourceGroup, clusterId.ClusterName, clusterPatch); err != nil {
+	future, err := client.CreateOrUpdate(ctx, clusterId.ResourceGroup, clusterId.ClusterName, parameters)
+	if err != nil {
 		return fmt.Errorf("updating Log Analytics Cluster %q (Resource Group %q): %+v", clusterId.ClusterName, clusterId.ResourceGroup, err)
 	}
 
-	updateWait := logAnalyticsClusterWaitForState(ctx, meta, d.Timeout(pluginsdk.TimeoutUpdate), clusterId.ResourceGroup, clusterId.ClusterName)
+	if err := future.WaitForCompletionRef(ctx, client.Client); err != nil {
+		return fmt.Errorf("waiting on creating future for Log Analytics Cluster %q (Resource Group %q): %+v", clusterId.ClusterName, clusterId.ResourceGroup, err)
+	}
+
+	if _, err = client.Get(ctx, clusterId.ResourceGroup, clusterId.ClusterName); err != nil {
+		return fmt.Errorf("retrieving Log Analytics Cluster %q (Resource Group %q): %+v", clusterId.ClusterName, clusterId.ResourceGroup, err)
+	}
+
+	updateWait := logAnalyticsClusterWaitForState(ctx, meta, d.Timeout(pluginsdk.TimeoutCreate), clusterId.ResourceGroup, clusterId.ClusterName)
 
 	if _, err := updateWait.WaitForStateContext(ctx); err != nil {
 		return fmt.Errorf("waiting for Log Analytics Cluster to finish updating %q (Resource Group %q): %v", clusterId.ClusterName, clusterId.ResourceGroup, err)
@@ -180,21 +193,61 @@ func resourceLogAnalyticsClusterCustomerManagedKeyDelete(d *pluginsdk.ResourceDa
 		return err
 	}
 
-	clusterPatch := operationalinsights.ClusterPatch{
-		ClusterPatchProperties: &operationalinsights.ClusterPatchProperties{
-			KeyVaultProperties: &operationalinsights.KeyVaultProperties{
-				KeyVaultURI: nil,
-				KeyName:     nil,
-				KeyVersion:  nil,
-			},
+	locks.ByName(clusterId.ClusterName, "azurerm_log_analytics_cluster")
+	defer locks.UnlockByName(clusterId.ClusterName, "azurerm_log_analytics_cluster")
+
+	// Since this isn't a real object, just modifying an existing object
+	// "Delete" doesn't really make sense it should really be a "Revert to Default"
+	// So instead of the Delete func actually deleting the Log Analytics cluster I am
+	// making it reset the Log Analytics cluster to its default state
+
+	resp, err := client.Get(ctx, clusterId.ResourceGroup, clusterId.ClusterName)
+	if err != nil {
+		if utils.ResponseWasNotFound(resp.Response) {
+			log.Printf("[INFO] Log Analytics %q does not exist - removing from state", d.Id())
+			d.SetId("")
+			return nil
+		}
+		return fmt.Errorf("retrieving Log Analytics Cluster %q (Resource Group %q): %+v", clusterId.ClusterName, clusterId.ResourceGroup, err)
+	}
+
+	capacity := 0
+	if sku := resp.Sku; sku != nil {
+		if sku.Capacity != nil {
+			capacity = int(*sku.Capacity)
+		}
+	}
+
+	parameters := operationalinsights.Cluster{
+		Location: resp.Location,
+		Identity: resp.Identity,
+		Sku: &operationalinsights.ClusterSku{
+			Capacity: utils.Int64(int64(capacity)),
+			Name:     operationalinsights.CapacityReservation,
+		},
+		Tags: resp.Tags,
+		ClusterProperties: &operationalinsights.ClusterProperties{KeyVaultProperties: &operationalinsights.KeyVaultProperties{
+			KeyVaultURI: nil,
+			KeyName:     nil,
+			KeyVersion:  nil,
+		},
 		},
 	}
 
-	if _, err = client.Update(ctx, clusterId.ResourceGroup, clusterId.ClusterName, clusterPatch); err != nil {
-		return fmt.Errorf("removing Log Analytics Cluster Customer Managed Key from cluster %q (resource group %q)", clusterId.ClusterName, clusterId.ResourceGroup)
+	future, err := client.CreateOrUpdate(ctx, clusterId.ResourceGroup, clusterId.ClusterName, parameters)
+	if err != nil {
+		return fmt.Errorf("removing Log Analytics Cluster Customer Managed Key from cluster %q (Resource Group %q): %+v", clusterId.ClusterName, clusterId.ResourceGroup, err)
 	}
 
-	deleteWait := logAnalyticsClusterWaitForState(ctx, meta, d.Timeout(pluginsdk.TimeoutDelete), clusterId.ResourceGroup, clusterId.ClusterName)
+	if err := future.WaitForCompletionRef(ctx, client.Client); err != nil {
+		return fmt.Errorf("waiting on removing future for Log Analytics Cluster %q (Resource Group %q): %+v", clusterId.ClusterName, clusterId.ResourceGroup, err)
+	}
+
+	if _, err = client.Get(ctx, clusterId.ResourceGroup, clusterId.ClusterName); err != nil {
+		return fmt.Errorf("retrieving Log Analytics Cluster %q (Resource Group %q): %+v", clusterId.ClusterName, clusterId.ResourceGroup, err)
+	}
+
+	deleteWait := logAnalyticsClusterWaitForState(ctx, meta, d.Timeout(pluginsdk.TimeoutCreate), clusterId.ResourceGroup, clusterId.ClusterName)
 
 	if _, err := deleteWait.WaitForStateContext(ctx); err != nil {
 		return fmt.Errorf("waiting for Log Analytics Cluster to finish updating %q (Resource Group %q): %v", clusterId.ClusterName, clusterId.ResourceGroup, err)
